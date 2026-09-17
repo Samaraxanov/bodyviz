@@ -4,19 +4,37 @@
   "main": "index.ts",
   "dependencies": {
     "expo": "~57.0.23",
+    "expo-asset": "~57.0.17",
+    "expo-gl": "~57.0.2",
+    "expo-haptics": "~57.0.3",
     "expo-status-bar": "~57.0.1",
     "react": "19.2.3",
-    "react-native": "0.86.3"
+    "react-native": "0.86.3",
+    "react-native-safe-area-context": "~5.7.0",
+    "three": "0.186.0"
   },
   "devDependencies": {
+    "@types/node": "^22.20.3",
     "@types/react": "~19.2.2",
+    "@types/three": "^0.186.0",
+    "tsx": "^4.23.13",
     "typescript": "~6.0.3"
   },
   "scripts": {
     "start": "expo start",
-    "android": "expo start --android",
-    "ios": "expo start --ios",
-    "web": "expo start --web"
+    "start:clear": "expo start --clear",
+    "ios": "expo run:ios",
+    "ios:device": "expo run:ios --device",
+    "android": "expo run:android",
+    "web": "expo start --web",
+    "build:ios": "expo run:ios",
+    "build:android": "expo run:android",
+    "typecheck": "tsc --noEmit && tsc -p tools",
+    "doctor": "npx --yes expo-doctor",
+    "model": "tsx tools/render-body.ts",
+    "measure": "tsx tools/measure.ts",
+    "clean": "rm -rf .expo node_modules/.cache && expo start --clear"
   },
-  "private": true
+  "private": true,
+  "packageManager": "yarn@1.22.22"
 }
