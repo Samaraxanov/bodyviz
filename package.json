@@ -5,6 +5,7 @@
   "dependencies": {
     "expo": "~57.0.23",
     "expo-asset": "~57.0.17",
+    "expo-build-properties": "~57.0.21",
     "expo-gl": "~57.0.2",
     "expo-haptics": "~57.0.3",
     "expo-status-bar": "~57.0.1",
