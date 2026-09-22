@@ -1,5 +1,5 @@
-import React, { useCallback, useEffect, useMemo, useRef } from 'react';
-import { AppState, LayoutChangeEvent, PanResponder, StyleSheet, View } from 'react-native';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { AppState, LayoutChangeEvent, PanResponder, StyleSheet, Text, View } from 'react-native';
 import { ExpoWebGLRenderingContext, GLView } from 'expo-gl';
 import * as THREE from 'three';
 
@@ -69,6 +69,20 @@ const PITCH_PER_PX = 0.006;
 const FLING = 0.85;
 /** Ceiling on the coast, in rad/s -- about one turn a second. */
 const MAX_FLING = 6.5;
+
+/**
+ * Gesture readout, for working out why a drag does nothing. The previous
+ * version of this drove a `setInterval` at 400ms, so it re-rendered the viewer
+ * 2.5 times a second forever -- a hitch in the middle of every drag, and worse
+ * than the problem it was diagnosing. This one only writes state when a
+ * gesture starts and ends, so an idle viewer pays nothing.
+ *
+ * Reading it: `raw` counts touches that reached the overlay at all, `grant`
+ * that the responder took the gesture, `move` that it is receiving movement.
+ * raw 0 means the touch never arrives -- a hit-testing problem, not a gesture
+ * one. grant with move 0 means the responder is being taken away again.
+ */
+const SHOW_GESTURE_DEBUG = __DEV__;
 
 export interface BodyViewerHandle {
   resetView: () => void;
@@ -207,6 +221,17 @@ export default function BodyViewer({
   // Held in a ref so the render loop never closes over a stale callback.
   const onFirstFrameRef = useRef(onFirstFrame);
   onFirstFrameRef.current = onFirstFrame;
+  const diag = useRef({ raw: 0, grant: 0, move: 0, noTouchList: 0 });
+  const [diagText, setDiagText] = useState('');
+  const reportDiag = useCallback(() => {
+    if (!SHOW_GESTURE_DEBUG) return;
+    const d = diag.current;
+    const o = orbit.current;
+    setDiagText(
+      `raw ${d.raw}  grant ${d.grant}  move ${d.move}  noTouchList ${d.noTouchList}\n` +
+        `yaw ${o.yaw.toFixed(2)}  drag ${o.dragging ? 1 : 0}`,
+    );
+  }, []);
 
   // Coming back from the background can hand us a fresh surface, so the
   // flush-priming has to happen again or the canvas returns black.
@@ -457,6 +482,17 @@ export default function BodyViewer({
     s.dirty = true;
   };
 
+  /**
+   * Mark the stage for a redraw. Every gesture callback calls this rather than
+   * relying on `orbit.dragging` to imply it: the loop only draws when
+   * something says it should, and a handler that moves the camera without
+   * saying so leaves the last frame on screen -- a viewer that silently
+   * ignores the drag.
+   */
+  const invalidate = useCallback(() => {
+    if (stage.current) stage.current.dirty = true;
+  }, []);
+
   const responder = useMemo(
     () =>
       PanResponder.create({
@@ -477,12 +513,21 @@ export default function BodyViewer({
           pinchDist.current = 0;
           yawRate.current = 0;
           lastMoveAt.current = Date.now();
+          invalidate();
+          diag.current.grant++;
+          reportDiag();
         },
         onPanResponderMove: (evt, gesture) => {
           const s = orbit.current;
+          invalidate();
+          diag.current.move++;
+          // Not every platform hands back a touch list on every move event,
+          // and an unguarded `.length` here throws inside the handler -- which
+          // surfaces as a drag that does nothing at all, silently.
           const touches = evt.nativeEvent.touches;
+          if (!touches) diag.current.noTouchList++;
 
-          if (touches.length >= 2) {
+          if (touches && touches.length >= 2) {
             const d = Math.hypot(
               touches[0].pageX - touches[1].pageX,
               touches[0].pageY - touches[1].pageY,
@@ -491,7 +536,6 @@ export default function BodyViewer({
               s.zoom = Math.min(1.8, Math.max(0.42, s.zoom * (pinchDist.current / d)));
             }
             pinchDist.current = d;
-            if (stage.current) stage.current.dirty = true;
             // Deltas are meaningless mid-pinch; re-baseline so the model
             // doesn't jump when the second finger lifts.
             lastDx.current = gesture.dx;
@@ -529,15 +573,18 @@ export default function BodyViewer({
           const coast = stale ? 0 : yawRate.current * FLING;
           s.velocity = Math.max(-MAX_FLING, Math.min(MAX_FLING, coast));
           yawRate.current = 0;
+          invalidate();
+          reportDiag();
         },
         onPanResponderTerminate: () => {
           orbit.current.dragging = false;
           orbit.current.velocity = 0;
           pinchDist.current = 0;
           yawRate.current = 0;
+          invalidate();
         },
       }),
-    [],
+    [invalidate, reportDiag],
   );
 
   // The gesture lives on a plain transparent View laid over the canvas rather
@@ -547,7 +594,17 @@ export default function BodyViewer({
   // the responder negotiation sees it. An ordinary RN view on top is a touch
   // target the responder system owns end to end, so a drag can't go missing.
   return (
-    <View style={styles.root} onLayout={onLayout}>
+    <View
+      style={styles.root}
+      onLayout={onLayout}
+      onTouchStart={
+        SHOW_GESTURE_DEBUG
+          ? () => {
+              diag.current.raw++;
+            }
+          : undefined
+      }
+    >
       <GLView
         style={styles.canvas}
         // The figure is all smooth organic curves, so 2x MSAA is visually
@@ -557,6 +614,11 @@ export default function BodyViewer({
         onContextCreate={onContextCreate}
       />
       <View style={styles.touch} collapsable={false} {...responder.panHandlers} />
+      {SHOW_GESTURE_DEBUG && diagText ? (
+        <Text style={styles.diag} pointerEvents="none">
+          {diagText}
+        </Text>
+      ) : null}
     </View>
   );
 }
@@ -565,4 +627,12 @@ const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: theme.bgSunken },
   canvas: { flex: 1 },
   touch: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 },
+  diag: {
+    position: 'absolute',
+    top: 6,
+    left: 8,
+    color: '#6EE7B7',
+    fontSize: 11,
+    fontVariant: ['tabular-nums'],
+  },
 });
