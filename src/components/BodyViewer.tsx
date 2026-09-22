@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef } from 'react';
-import { AppState, LayoutChangeEvent, PanResponder, StyleSheet, Text, View } from 'react-native';
+import { AppState, LayoutChangeEvent, PanResponder, StyleSheet, View } from 'react-native';
 import { ExpoWebGLRenderingContext, GLView } from 'expo-gl';
 import * as THREE from 'three';
 
@@ -38,6 +38,19 @@ interface Stage {
   frame: number;
   /** Frames still to be force-flushed; see the note in the render loop. */
   prime: number;
+  /**
+   * Something changed that the last drawn frame does not show yet. The loop is
+   * otherwise allowed to draw nothing at all -- see the note on `tick`.
+   */
+  dirty: boolean;
+  /**
+   * Which render loop owns this stage. A surface can be handed to us more than
+   * once (backgrounding on iOS, a TextureView recreation on Android), and the
+   * old loop keeps its own `requestAnimationFrame` chain alive -- so without a
+   * generation check two loops end up drawing the same scene and every frame
+   * costs twice what it should.
+   */
+  loop: number;
 }
 
 const MIN_PITCH = -0.35;
@@ -86,7 +99,6 @@ function geometryFor(body: BodyResult): THREE.BufferGeometry {
   g.setAttribute('normal', new THREE.BufferAttribute(body.normals, 3));
   g.setAttribute('color', new THREE.BufferAttribute(body.colors, 3));
   g.setIndex(new THREE.BufferAttribute(body.indices, 1));
-  g.computeBoundingSphere();
   return g;
 }
 
@@ -113,7 +125,6 @@ function updateGeometry(g: THREE.BufferGeometry, body: BodyResult): boolean {
   position.needsUpdate = true;
   normal.needsUpdate = true;
   color.needsUpdate = true;
-  g.computeBoundingSphere();
   return true;
 }
 
@@ -183,6 +194,8 @@ export default function BodyViewer({
     autoRotate: false,
   });
   const stage = useRef<Stage | null>(null);
+  /** Bumped per surface, so only the newest render loop survives. */
+  const loopGen = useRef(0);
   const bodyRef = useRef(body);
   bodyRef.current = body;
   const lastDx = useRef(0);
@@ -194,23 +207,6 @@ export default function BodyViewer({
   // Held in a ref so the render loop never closes over a stale callback.
   const onFirstFrameRef = useRef(onFirstFrame);
   onFirstFrameRef.current = onFirstFrame;
-
-  /* DEBUG-HUD START */
-  const dbg = useRef({ frames: 0, grants: 0, moves: 0, raw: 0, touches: 'n/a', err: '' });
-  const [hud, setHud] = React.useState('');
-  useEffect(() => {
-    const id = setInterval(() => {
-      const d = dbg.current;
-      setHud(
-        `f=${d.frames} raw=${d.raw} grant=${d.grants} move=${d.moves} t=${d.touches}\n` +
-          `yaw=${orbit.current.yaw.toFixed(2)} dist=${orbit.current.distance.toFixed(2)} ` +
-          `drag=${orbit.current.dragging ? 1 : 0}` +
-          (d.err ? `\nERR ${d.err}` : ''),
-      );
-    }, 400);
-    return () => clearInterval(id);
-  }, []);
-  /* DEBUG-HUD END */
 
   // Coming back from the background can hand us a fresh surface, so the
   // flush-priming has to happen again or the canvas returns black.
@@ -233,7 +229,10 @@ export default function BodyViewer({
     }
 
     s.shadow.scale.set(H * 0.7, H * 0.5, 1);
+    s.shadow.updateMatrix();
     s.ring.scale.setScalar(H / 1.75);
+    s.ring.updateMatrix();
+    s.dirty = true;
 
     const vFov = (FOV * Math.PI) / 180;
     const fit = (H * 0.62) / Math.tan(vFov / 2);
@@ -255,10 +254,12 @@ export default function BodyViewer({
         s.velocity = 0;
         s.zoom = 1;
         s.autoRotate = false;
+        if (stage.current) stage.current.dirty = true;
       },
       toggleAutoRotate: () => {
         orbit.current.autoRotate = !orbit.current.autoRotate;
         orbit.current.velocity = 0;
+        if (stage.current) stage.current.dirty = true;
         return orbit.current.autoRotate;
       },
     });
@@ -266,6 +267,8 @@ export default function BodyViewer({
 
   const onContextCreate = useCallback(
     (gl: ExpoWebGLRenderingContext) => {
+      const loopId = ++loopGen.current;
+
       // expo-gl only wires up its default framebuffer once a frame has been
       // ended. Without this priming frame three renders happily -- correct draw
       // calls, no GL errors -- into a surface that is never presented.
@@ -309,6 +312,11 @@ export default function BodyViewer({
           vertexColors: true,
         }),
       );
+      // Always on screen (see geometryFor) and never transformed, so neither
+      // the cull test nor the per-frame matrix refresh has anything to decide.
+      bodyMesh.frustumCulled = false;
+      bodyMesh.matrixAutoUpdate = false;
+      bodyMesh.updateMatrix();
       scene.add(bodyMesh);
 
       const shadow = new THREE.Mesh(
@@ -322,6 +330,8 @@ export default function BodyViewer({
       );
       shadow.rotation.x = -Math.PI / 2;
       shadow.position.y = 0.002;
+      shadow.matrixAutoUpdate = false;
+      shadow.updateMatrix();
       scene.add(shadow);
 
       const ring = new THREE.Mesh(
@@ -336,19 +346,34 @@ export default function BodyViewer({
       );
       ring.rotation.x = -Math.PI / 2;
       ring.position.y = 0.001;
+      ring.matrixAutoUpdate = false;
+      ring.updateMatrix();
       scene.add(ring);
 
       stage.current = {
         renderer, scene, camera, body: bodyMesh, shadow, ring, gl,
         frame: 0,
         prime: PRIME_FRAMES,
+        dirty: true,
+        loop: loopId,
       };
       applyBody(bodyRef.current);
 
       let last = Date.now();
+      /**
+       * The loop runs every frame but only *draws* on frames that would look
+       * different from the one already on screen. A still figure is the common
+       * case -- reading the numbers, mid-thought, anything that isn't an active
+       * drag -- and drawing it again 60 times a second buys nothing while
+       * keeping the JS thread busy. That matters here beyond battery: touches
+       * are delivered on the JS thread too, so a render that is always running
+       * is a render the next `onPanResponderMove` has to queue behind, which is
+       * exactly what a laggy drag feels like.
+       */
       const tick = () => {
         const s = stage.current;
-        if (!s) return;
+        // A stale loop from a previous surface: let it die.
+        if (!s || s.loop !== loopId) return;
         s.frame = requestAnimationFrame(tick);
 
         const now = Date.now();
@@ -356,14 +381,25 @@ export default function BodyViewer({
         last = now;
 
         const o = orbit.current;
+        let moving = o.dragging || o.autoRotate || o.velocity !== 0;
         if (!o.dragging) {
           o.yaw += o.velocity * step;
           o.velocity *= Math.pow(DAMPING, step);
           if (Math.abs(o.velocity) < 0.001) o.velocity = 0;
           if (o.autoRotate) o.yaw += 0.55 * step;
         }
+
         const target = o.fitDistance * o.zoom;
-        o.distance += (target - o.distance) * Math.min(1, step * 10);
+        const gap = target - o.distance;
+        if (Math.abs(gap) > 1e-4 * Math.max(1e-6, target)) {
+          o.distance += gap * Math.min(1, step * 10);
+          moving = true;
+        } else {
+          o.distance = target;
+        }
+
+        if (!moving && !s.dirty && s.prime <= 0) return;
+        s.dirty = false;
 
         const focusY = bodyRef.current.metrics.height * 0.52;
         const cp = Math.cos(o.pitch);
@@ -374,7 +410,6 @@ export default function BodyViewer({
         );
         s.camera.lookAt(0, focusY, 0);
 
-        dbg.current.frames++;
         s.renderer.render(s.scene, s.camera);
 
         // Draining expo-gl's command queue is what actually gets a frame onto
@@ -419,6 +454,7 @@ export default function BodyViewer({
     if (width <= 0 || height <= 0) return;
     s.camera.aspect = width / height;
     s.camera.updateProjectionMatrix();
+    s.dirty = true;
   };
 
   const responder = useMemo(
@@ -432,7 +468,6 @@ export default function BodyViewer({
         onPanResponderTerminationRequest: () => false,
         onShouldBlockNativeResponder: () => true,
         onPanResponderGrant: () => {
-          dbg.current.grants++;
           const s = orbit.current;
           s.dragging = true;
           s.autoRotate = false;
@@ -444,10 +479,8 @@ export default function BodyViewer({
           lastMoveAt.current = Date.now();
         },
         onPanResponderMove: (evt, gesture) => {
-          dbg.current.moves++;
           const s = orbit.current;
           const touches = evt.nativeEvent.touches;
-          dbg.current.touches = touches === undefined ? 'undef' : String(touches.length);
 
           if (touches.length >= 2) {
             const d = Math.hypot(
@@ -458,6 +491,7 @@ export default function BodyViewer({
               s.zoom = Math.min(1.8, Math.max(0.42, s.zoom * (pinchDist.current / d)));
             }
             pinchDist.current = d;
+            if (stage.current) stage.current.dirty = true;
             // Deltas are meaningless mid-pinch; re-baseline so the model
             // doesn't jump when the second finger lifts.
             lastDx.current = gesture.dx;
@@ -513,16 +547,16 @@ export default function BodyViewer({
   // the responder negotiation sees it. An ordinary RN view on top is a touch
   // target the responder system owns end to end, so a drag can't go missing.
   return (
-    <View
-      style={styles.root}
-      onLayout={onLayout}
-      onTouchStart={() => {
-        dbg.current.raw++;
-      }}
-    >
-      <GLView style={styles.canvas} onContextCreate={onContextCreate} />
+    <View style={styles.root} onLayout={onLayout}>
+      <GLView
+        style={styles.canvas}
+        // The figure is all smooth organic curves, so 2x MSAA is visually
+        // indistinguishable from 4x here and halves the per-frame resolve on a
+        // surface this size (native retina, ~1300x2800).
+        msaaSamples={2}
+        onContextCreate={onContextCreate}
+      />
       <View style={styles.touch} collapsable={false} {...responder.panHandlers} />
-      <Text style={styles.hud} pointerEvents="none">{hud}</Text>
     </View>
   );
 }
@@ -531,5 +565,4 @@ const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: theme.bgSunken },
   canvas: { flex: 1 },
   touch: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 },
-  hud: { position: 'absolute', top: 6, left: 8, color: '#6EE7B7', fontSize: 11, fontVariant: ['tabular-nums'] },
 });
