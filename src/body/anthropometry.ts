@@ -301,10 +301,10 @@ const MALE: ShapeParams = {
 
   arm: {
     acromion:  { t: 0.826, x: 0.061, z: -0.002, volume: 0.018, flat: 1.00, fat: 0.50 },
-    deltoid:   { t: 0.795, x: 0.095, z: -0.002, volume: 0.031, flat: 1.00, fat: 0.70 },
-    bicep:     { t: 0.740, x: 0.101, z: -0.002, volume: 0.027, flat: 1.00, fat: 0.95 },
-    elbow:     { t: 0.633, x: 0.105, z:  0.001, volume: 0.022, flat: 1.06, fat: 0.46 },
-    forearm:   { t: 0.598, x: 0.107, z:  0.003, volume: 0.024, flat: 1.10, fat: 0.56 },
+    deltoid:   { t: 0.795, x: 0.093, z: -0.002, volume: 0.034, flat: 1.00, fat: 0.70 },
+    bicep:     { t: 0.740, x: 0.099, z: -0.002, volume: 0.027, flat: 1.00, fat: 0.95 },
+    elbow:     { t: 0.633, x: 0.102, z:  0.001, volume: 0.022, flat: 1.06, fat: 0.46 },
+    forearm:   { t: 0.598, x: 0.102, z:  0.003, volume: 0.024, flat: 1.10, fat: 0.56 },
     wrist:     { t: 0.487, x: 0.110, z:  0.008, volume: 0.012, flat: 1.40, fat: 0.14 },
     knuckle:   { t: 0.443, x: 0.111, z:  0.012, volume: 0.010, flat: 2.65, fat: 0.12 },
     fingertip: { t: 0.385, x: 0.112, z:  0.014, volume: 0.005, flat: 2.60, fat: 0.06 },
@@ -447,10 +447,10 @@ const FEMALE: ShapeParams = {
 
   arm: {
     acromion:  { t: 0.826, x: 0.055, z: -0.002, volume: 0.017, flat: 1.00, fat: 0.50 },
-    deltoid:   { t: 0.795, x: 0.087, z: -0.002, volume: 0.028, flat: 1.00, fat: 0.78 },
-    bicep:     { t: 0.740, x: 0.092, z: -0.002, volume: 0.025, flat: 1.00, fat: 1.05 },
-    elbow:     { t: 0.633, x: 0.096, z:  0.001, volume: 0.020, flat: 1.06, fat: 0.50 },
-    forearm:   { t: 0.598, x: 0.098, z:  0.003, volume: 0.021, flat: 1.10, fat: 0.60 },
+    deltoid:   { t: 0.795, x: 0.085, z: -0.002, volume: 0.031, flat: 1.00, fat: 0.78 },
+    bicep:     { t: 0.740, x: 0.090, z: -0.002, volume: 0.025, flat: 1.00, fat: 1.05 },
+    elbow:     { t: 0.633, x: 0.093, z:  0.001, volume: 0.020, flat: 1.06, fat: 0.50 },
+    forearm:   { t: 0.598, x: 0.094, z:  0.003, volume: 0.021, flat: 1.10, fat: 0.60 },
     wrist:     { t: 0.487, x: 0.101, z:  0.008, volume: 0.010, flat: 1.40, fat: 0.14 },
     knuckle:   { t: 0.443, x: 0.102, z:  0.012, volume: 0.009, flat: 2.65, fat: 0.12 },
     fingertip: { t: 0.385, x: 0.103, z:  0.014, volume: 0.004, flat: 2.60, fat: 0.06 },

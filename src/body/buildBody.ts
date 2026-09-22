@@ -433,11 +433,13 @@ export function buildBody({ heightCm, weightKg, sex }: BodyInput): BodyResult {
     range: mb.addStack(legSections, 'y', { ...legCaps, flipX: true }),
   });
 
-  const head = headSections(shape.head, H, 1, torsoScales[shoulderIdx]);
+  const headGirth = torsoScales[shoulderIdx];
+  const head = headSections(shape.head, H, 1, headGirth);
   ranges.push({ part: PART.head, range: mb.addStack(head, 'y') });
   // Ears belong to the head for occlusion purposes, or the skull they sit in
-  // would black them out.
-  for (const ear of earSections(shape.head, H, 1)) {
+  // would black them out. They take the same girth scaling as the skull, or
+  // they drift off its surface on a heavier figure.
+  for (const ear of earSections(shape.head, H, 1, headGirth)) {
     ranges.push({ part: PART.head, range: mb.addStack(ear, 'y') });
   }
 

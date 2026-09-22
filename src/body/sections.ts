@@ -47,8 +47,8 @@ export const TORSO_RINGS = 88;
 export const TORSO_SEGMENTS = 56;
 export const LIMB_RINGS = 56;
 export const LIMB_SEGMENTS = 28;
-export const HEAD_RINGS = 30;
-export const HEAD_SEGMENTS = 28;
+export const HEAD_RINGS = 46;
+export const HEAD_SEGMENTS = 32;
 export const FOOT_SEGMENTS = 20;
 
 /**
@@ -400,77 +400,173 @@ export function neckRings(neck: NeckShape, H: number): Ring[] {
 /* --------------------------------- head --------------------------------- */
 
 /**
- * The head, as a stack of rings rather than a bare ellipsoid: the cranium is
- * fuller at the back, the jaw holds a width so the neck has something to meet,
- * and the chin comes forward.
+ * Head stations, from under the jaw (u = 0) to the vertex (u = 1): half-width
+ * and half-depth as fractions of the head's own, the sagittal shift of the
+ * slice centre as a fraction of half-depth, and the superellipse exponent.
+ *
+ * The head used to be an ellipsoid with a width floor bolted underneath to stop
+ * it tapering to a point. That is why it read as an egg: a cranium and a face
+ * are different shapes and an ellipsoid is neither of them. The cranium is
+ * widest well above the ears and nearly spherical; the face narrows from the
+ * cheekbones down to a chin; and the two meet at a jaw that is squarer in
+ * section than anything above it.
+ *
+ * `shift` is the column doing the quiet work. The mandible hangs *forward* of
+ * the cervical spine, and without that the chin lands behind the throat -- so
+ * the neck reads as a collar swallowing the jaw, which is precisely what the
+ * old head did in profile. The first station is deliberately tucked back and
+ * small: it is buried inside the neck, and only the stations above it emerge.
  */
+//                  u     width  depth  shift  corner
+const HEAD_PROFILE: [number, number, number, number, number][] = [
+  [0.000, 0.18, 0.24, 0.14, 2.50],
+  [0.050, 0.42, 0.46, 0.30, 2.60],
+  [0.100, 0.58, 0.58, 0.28, 2.70],
+  [0.160, 0.70, 0.70, 0.24, 2.70],
+  [0.260, 0.80, 0.82, 0.16, 2.60],
+  [0.380, 0.91, 0.91, 0.08, 2.40],
+  [0.500, 0.97, 0.97, 0.02, 2.30],
+  [0.620, 0.99, 1.00, -0.02, 2.20],
+  [0.740, 1.00, 0.99, -0.05, 2.15],
+  [0.860, 0.89, 0.88, -0.05, 2.10],
+  [0.940, 0.68, 0.66, -0.04, 2.05],
+  [0.985, 0.34, 0.33, -0.04, 2.00],
+  [1.000, 0.10, 0.10, -0.04, 2.00],
+];
+
+/**
+ * The features that turn a skull-shaped solid into a face. Heights are in the
+ * head's own u, so they move with the head rather than with stature.
+ */
+function headRelief(head: HeadShape): Relief[] {
+  return [
+    { name: 'occiput', at: 0.720, rise: 0.160, around: ANGLE.back, arc: 0.95, depth: head.occiput * 1.5 },
+    { name: 'temple', at: 0.585, rise: 0.055, around: ANGLE.side, arc: 0.28, depth: -0.035, paired: true },
+    { name: 'brow', at: 0.545, rise: 0.040, around: ANGLE.front, arc: 0.55, depth: 0.038 },
+    { name: 'eyeSocket', at: 0.495, rise: 0.028, around: ANGLE.front + 0.46, arc: 0.22, depth: -0.035, paired: true },
+    { name: 'noseBridge', at: 0.475, rise: 0.055, around: ANGLE.front, arc: 0.17, depth: 0.042 },
+    { name: 'nose', at: 0.400, rise: 0.055, around: ANGLE.front, arc: 0.17, depth: 0.085 },
+    { name: 'nostril', at: 0.335, rise: 0.028, around: ANGLE.front, arc: 0.21, depth: 0.045 },
+    { name: 'cheekbone', at: 0.400, rise: 0.055, around: ANGLE.front + 0.82, arc: 0.34, depth: 0.040, paired: true },
+    { name: 'mouth', at: 0.270, rise: 0.026, around: ANGLE.front, arc: 0.20, depth: 0.030 },
+    { name: 'jawAngle', at: 0.215, rise: 0.048, around: ANGLE.front + 1.32, arc: 0.32, depth: 0.045 * head.jaw, paired: true },
+    { name: 'chin', at: 0.120, rise: 0.040, around: ANGLE.front, arc: 0.34, depth: head.chin * 1.2 },
+  ];
+}
+
+/**
+ * Head relief, applied in place. Unlike the torso's this is deliberately *not*
+ * renormalised back to the contour's original area. The head sits outside the
+ * volume solver -- it barely tracks body mass at all -- so a nose is free to
+ * add the few millilitres a nose adds. Area-preserving relief would pull the
+ * cheeks in by exactly as much as it pushed the nose out, which is how you get
+ * a face that looks pinched around a beak.
+ */
+function applyHeadRelief(pts: number[], relief: Relief[], u: number): void {
+  const angles = contourAngles(pts);
+  const n = pts.length / 2;
+  const field = new Float64Array(n);
+  let touched = false;
+
+  for (const f of relief) {
+    const dt = (u - f.at) / f.rise;
+    if (Math.abs(dt) > 3) continue;
+    const amount = f.depth * Math.exp(-(dt * dt));
+    if (Math.abs(amount) < 1e-4) continue;
+    gather(field, angles, f.around, f.arc, amount);
+    if (f.paired) gather(field, angles, Math.PI - f.around, f.arc, amount);
+    touched = true;
+  }
+  if (!touched) return;
+
+  for (let j = 0; j < n; j++) {
+    const k = Math.max(1 - MAX_HOLLOW, 1 + field[j]);
+    pts[j * 2] *= k;
+    pts[j * 2 + 1] *= k;
+  }
+}
+
+/** Where the ear canal sits in head-u: behind and a little below the eyes. */
+const EAR_AT = 0.44;
+
+/** Ear outline from lobe (0) to the top of the helix (1). */
+const EAR_PROFILE_U = [0.00, 0.10, 0.25, 0.45, 0.65, 0.82, 0.93, 1.00];
+const EAR_PROFILE_R = [0.20, 0.50, 0.76, 0.93, 1.00, 0.94, 0.72, 0.28];
+
 export function headSections(head: HeadShape, H: number, calib: number, girth: number): Section[] {
   // The head barely tracks body mass; a light touch keeps proportions believable.
   const k = 1 + (girth - 1) * 0.16;
   const a = head.width * H * calib * k;
   const b = head.depth * H * calib * k;
   const c = head.height * H * k;
+  const bottom = head.t * H - c;
+  const span = 2 * c;
+
+  const us = HEAD_PROFILE.map((r) => r[0]);
+  const ws = HEAD_PROFILE.map((r) => r[1]);
+  const ds = HEAD_PROFILE.map((r) => r[2]);
+  const zs = HEAD_PROFILE.map((r) => r[3]);
+  const ns = HEAD_PROFILE.map((r) => r[4]);
+  const relief = headRelief(head);
 
   const sections: Section[] = [];
   for (let i = 0; i < HEAD_RINGS; i++) {
-    const phi = -Math.PI / 2 + (Math.PI * i) / (HEAD_RINGS - 1);
-    const v = Math.sin(phi);
-    let rf = Math.cos(phi);
-    // An ellipsoid tapers to nothing at the chin, which leaves the neck wider
-    // than the head it joins and shows as a collar. Hold a jaw width instead,
-    // and only collapse it over the last sliver.
-    if (v < 0) {
-      const jaw =
-        v > -0.9 ? head.jaw : head.jaw * Math.max(0, 1 - (-v - 0.9) / 0.1) ** 0.7;
-      rf = Math.max(rf, jaw);
-    }
-    // Temples narrow, cheekbones don't: pinch the width a little above the jaw.
-    const widthF = rf * (1 - 0.06 * Math.exp(-(((v - 0.2) / 0.28) ** 2)));
+    const u = i / (HEAD_RINGS - 1);
+    // The jaw dial broadens or narrows the lower face and leaves the skull
+    // alone -- a heavy jaw is a different face, not a different sized head.
+    const jawF = 1 + (head.jaw - 0.85) * 1.1 * Math.max(0, 1 - u / 0.42);
 
     const ring = superellipse(
-      Math.max(1e-4, a * widthF),
-      Math.max(1e-4, b * rf),
-      2.1,
+      Math.max(1e-4, a * spline(us, ws, u) * jawF),
+      Math.max(1e-4, b * spline(us, ds, u)),
+      spline(us, ns, u),
       HEAD_SEGMENTS,
     );
+    applyHeadRelief(ring, relief, u);
 
-    // Skulls are not front-back symmetric: the occiput swells behind, the chin
-    // juts forward, the brow sits over a slightly recessed mid-face.
-    const occiput = -head.occiput * b * Math.exp(-(((v - 0.15) / 0.5) ** 2));
-    const chin = head.chin * b * Math.exp(-(((v + 0.68) / 0.26) ** 2));
-    const zShift = head.shift * H + occiput + chin;
+    const zShift = head.shift * H + spline(us, zs, u) * b;
     for (let j = 1; j < ring.length; j += 2) ring[j] += zShift;
 
-    sections.push({ p: head.t * H + v * c, pts: ring });
+    sections.push({ p: bottom + u * span, pts: ring });
   }
   return sections;
 }
 
 /** Ears. Small, but they are most of what says "head" rather than "egg". */
-export function earSections(head: HeadShape, H: number, calib: number): Section[][] {
-  const c = head.height * H;
-  const a = head.width * H * calib;
-  const b = head.depth * H * calib;
-  const earH = head.ear * H * 2.1;
-  const earY = head.t * H - c * 0.1;
-  const earX = a * 0.95;
-  const earZ = head.shift * H - b * 0.16;
-  const earOut = head.ear * H * calib * 0.4;
-  const earDepth = head.ear * H * calib * 0.58;
+export function earSections(head: HeadShape, H: number, calib: number, girth = 1): Section[][] {
+  const k = 1 + (girth - 1) * 0.16;
+  const a = head.width * H * calib * k;
+  const b = head.depth * H * calib * k;
+  const c = head.height * H * k;
+  const bottom = head.t * H - c;
+  const span = 2 * c;
+
+  const earH = head.ear * H * 2.4;
+  const midY = bottom + EAR_AT * span;
+  // Against the widest part of the lower skull, and well behind mid-depth: the
+  // canal sits behind the eye line, not level with it.
+  const earX = a * 0.93;
+  const earZ = head.shift * H - b * 0.20;
+  const out = head.ear * H * calib * 0.44;
+  const deep = head.ear * H * calib * 0.62;
 
   return [1, -1].map((side) => {
     const ear: Section[] = [];
-    const steps = 9;
+    const steps = 13;
     for (let i = 0; i < steps; i++) {
       const u = i / (steps - 1);
-      // Rounder at the top than at the lobe, so it reads as an ear and not a leaf.
-      const bulge = Math.max(0.08, Math.sin(Math.PI * Math.min(1, u * 1.12)) ** 0.5);
-      const pts = superellipse(earOut * bulge, earDepth * bulge, 2.2, 14);
+      // Fullest through the upper helix and tapering to a small lobe. A
+      // symmetric bulge -- widest in the middle, pointed at both ends -- is
+      // what made the old ear read as a leaf stuck on the side of the skull.
+      const f = spline(EAR_PROFILE_U, EAR_PROFILE_R, u);
+      const pts = superellipse(out * f, deep * f, 2.3, 14);
+      // Rake the whole thing backwards as it rises, and let it stand slightly
+      // further off the skull at the helix than at the lobe.
       for (let j = 0; j < pts.length; j += 2) {
-        pts[j] += side * earX;
-        pts[j + 1] += earZ;
+        pts[j] += side * (earX + out * 0.30 * f);
+        pts[j + 1] += earZ - b * 0.10 * u;
       }
-      ear.push({ p: earY - earH / 2 + u * earH, pts });
+      ear.push({ p: midY - earH * 0.45 + u * earH, pts });
     }
     return ear;
   });

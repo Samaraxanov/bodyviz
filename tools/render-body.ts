@@ -39,12 +39,18 @@ function png(rgb: Uint8Array, w: number, h: number): Buffer {
   ]);
 }
 
-function render(body: BodyResult, yaw: number): Uint8Array {
+/**
+ * `focusT` is what the camera looks at and `spanT` how much of the figure fills
+ * the frame, both as fractions of stature. The defaults frame the whole body;
+ * `yarn model 178 76 male out.png head` reframes onto the head, which is the
+ * only way to actually judge a face at this resolution.
+ */
+function render(body: BodyResult, yaw: number, focusT = 0.52, spanT = 1.24): Uint8Array {
   const img = new Uint8Array(W * H * 3).fill(16);
   const zbuf = new Float32Array(W * H).fill(Infinity);
   const stature = body.metrics.height;
-  const focus = stature * 0.52;
-  const dist = (stature * 0.62) / Math.tan((32 * Math.PI) / 180 / 2);
+  const focus = stature * focusT;
+  const dist = (stature * (spanT / 2)) / Math.tan((32 * Math.PI) / 180 / 2);
   const cx = Math.sin(yaw) * dist, cz = Math.cos(yaw) * dist;
   const fwd = [-cx, 0, -cz].map((v) => v / dist);
   const right = [Math.cos(yaw), 0, -Math.sin(yaw)];
@@ -89,7 +95,15 @@ function render(body: BodyResult, yaw: number): Uint8Array {
         const w1 = (c[0] - b[0]) * (py - b[1]) - (px - b[0]) * (c[1] - b[1]);
         const w2 = (a[0] - c[0]) * (py - c[1]) - (px - c[0]) * (a[1] - c[1]);
         if (w0 > 0 || w1 > 0 || w2 > 0) continue;
-        const z = (a[2] + b[2] + c[2]) / 3;
+        // Perspective-correct per-pixel depth. A single depth for the whole
+        // triangle is enough for a silhouette but not for a surface seen at a
+        // grazing angle: neighbouring triangles then sort by their centroids
+        // and interleave, which paints diagonal creases across flat-on areas
+        // like a cheek -- mesh defects that are not in the mesh.
+        const sum = w0 + w1 + w2;
+        const z = sum === 0
+          ? (a[2] + b[2] + c[2]) / 3
+          : sum / (w1 / a[2] + w2 / b[2] + w0 / c[2]);
         const o = y * W + x;
         if (z >= zbuf[o]) continue;
         zbuf[o] = z;
@@ -100,14 +114,19 @@ function render(body: BodyResult, yaw: number): Uint8Array {
   return img;
 }
 
-const [hStr, wStr, sexArg, outArg] = process.argv.slice(2);
+const [hStr, wStr, sexArg, outArg, frameArg] = process.argv.slice(2);
 if (!hStr || !wStr || (sexArg !== 'male' && sexArg !== 'female')) {
   console.error('usage: yarn model <heightCm> <weightKg> <male|female> [out.png]');
   process.exit(1);
 }
 const out = outArg ?? `body-${hStr}-${wStr}-${sexArg}.png`;
 const body = buildBody({ heightCm: +hStr, weightKg: +wStr, sex: sexArg });
-const views = [0, Math.PI / 2, Math.PI, Math.PI * 1.5].map((y) => render(body, y));
+// Head framing keeps a little neck in shot; the jaw-to-throat junction is
+// where most of what looks wrong about a head actually shows up.
+const [focusT, spanT] = frameArg === 'head' ? [0.945, 0.26] : [0.52, 1.24];
+const views = [0, Math.PI / 2, Math.PI, Math.PI * 1.5].map((y) =>
+  render(body, y, focusT, spanT),
+);
 const sheet = new Uint8Array(W * 4 * H * 3).fill(16);
 views.forEach((v, k) => {
   for (let y = 0; y < H; y++)
