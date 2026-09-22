@@ -47,6 +47,22 @@ export const TORSO_RINGS = 88;
 export const TORSO_SEGMENTS = 56;
 export const LIMB_RINGS = 56;
 export const LIMB_SEGMENTS = 28;
+/**
+ * Arms are sampled finer than legs, and only because of the hand. A leg is an
+ * ellipse that changes slowly and 28 segments draw it exactly; a hand carries
+ * a thumb, a knuckle row and three finger gaps, and the gaps are the binding
+ * constraint. 36 specifically, and not 34 or 38: the gaps are placed at
+ * multiples of 2*PI/9 around an evenly spaced outline, so a multiple of 9 is
+ * what centres each of them on a vertex -- anything else drops them between
+ * vertices, where they become noise instead of fingers. The extra density is
+ * confined to the arms, so the legs, which are the larger stacks, pay nothing.
+ *
+ * Along the limb the hand is only a tenth of the arm's length, and the ring
+ * count has to fit a palm, a knuckle row and a finger block inside that tenth:
+ * 72 gives it seven rings, 56 gave it five.
+ */
+export const ARM_RINGS = 72;
+export const ARM_SEGMENTS = 36;
 export const HEAD_RINGS = 46;
 export const HEAD_SEGMENTS = 32;
 export const FOOT_SEGMENTS = 20;
@@ -99,6 +115,44 @@ function superellipse(a: number, b: number, n: number, segments: number): number
   return pts;
 }
 
+/**
+ * Resample a closed contour to `segments` points spaced evenly along it.
+ *
+ * Sampling a superellipse at uniform parameter is fine while it is roughly
+ * round, and wrong as soon as it is not. On the 3.6:1 slab a finger row wants,
+ * uniform parameter spends six of its ten points per quadrant on the outer
+ * quarter of the face and leaves the whole inner half to two of them -- so the
+ * face shades in bands, and no feature can be placed across it, because across
+ * most of it there is nothing to move. Even spacing puts the points where the
+ * surface is, which is what makes the finger gaps possible at all.
+ */
+function byArcLength(pts: number[], segments: number): number[] {
+  const n = pts.length / 2;
+  const cum = new Float64Array(n + 1);
+  for (let j = 0; j < n; j++) {
+    const k = (j + 1) % n;
+    const du = pts[k * 2] - pts[j * 2];
+    const dv = pts[k * 2 + 1] - pts[j * 2 + 1];
+    // Math.hypot guards against overflow that cannot happen at these
+    // magnitudes and costs several times a plain sqrt; this runs once per
+    // oversampled point on every ring of every rebuild.
+    cum[j + 1] = cum[j] + Math.sqrt(du * du + dv * dv);
+  }
+  const total = cum[n];
+  const out: number[] = new Array(segments * 2);
+  let seg = 0;
+  for (let i = 0; i < segments; i++) {
+    const target = (total * i) / segments;
+    while (seg < n - 1 && cum[seg + 1] < target) seg++;
+    const span = cum[seg + 1] - cum[seg];
+    const f = span > 1e-12 ? (target - cum[seg]) / span : 0;
+    const k = (seg + 1) % n;
+    out[i * 2] = pts[seg * 2] + (pts[k * 2] - pts[seg * 2]) * f;
+    out[i * 2 + 1] = pts[seg * 2 + 1] + (pts[k * 2 + 1] - pts[seg * 2 + 1]) * f;
+  }
+  return out;
+}
+
 /** Shortest angular distance between two directions, in [0, PI]. */
 function angleGap(a: number, b: number): number {
   let d = Math.abs(a - b) % (2 * Math.PI);
@@ -119,16 +173,24 @@ function contourAngles(pts: number[]): Float64Array {
   return angles;
 }
 
-/** Accumulate one feature's radial push into a per-point field. */
+/**
+ * Accumulate one feature's radial push into a per-point field.
+ *
+ * `where` is either the direction of each point or its position along the
+ * outline, both wrapped to 2*PI -- see `Relief.alongContour`. On a round
+ * section the two are the same thing; on a flat one they are not, and which
+ * one a feature wants depends on whether it is pinned to a direction (a bicep
+ * faces forward) or spaced across a surface (the gaps between four fingers).
+ */
 function gather(
   field: Float64Array,
-  angles: Float64Array,
+  where: Float64Array,
   around: number,
   arc: number,
   amount: number,
 ): void {
   for (let j = 0; j < field.length; j++) {
-    const g = angleGap(angles[j], around) / arc;
+    const g = angleGap(where[j], around) / arc;
     if (g > 3) continue;
     field[j] += amount * Math.exp(-(g * g));
   }
@@ -155,6 +217,7 @@ const MAX_HOLLOW = 0.55;
 function applyRelief(
   pts: number[],
   angles: Float64Array,
+  along: Float64Array | null,
   relief: Relief[],
   t: number,
   surplus: number,
@@ -171,8 +234,9 @@ function applyRelief(
     const gain = Math.max(0, 1 + (f.withFat ?? 0) * surplus);
     const amount = f.depth * reach * gain;
     if (Math.abs(amount) < 1e-4) continue;
-    gather(field, angles, f.around, f.arc, amount);
-    if (f.paired) gather(field, angles, Math.PI - f.around, f.arc, amount);
+    const where = f.alongContour && along ? along : angles;
+    gather(field, where, f.around, f.arc, amount);
+    if (f.paired) gather(field, where, Math.PI - f.around, f.arc, amount);
     touched = true;
   }
   if (!touched) return pts;
@@ -266,7 +330,7 @@ export function torsoRings(torso: TorsoShape, H: number): Ring[] {
     const plain = superellipse(a, b, corner, TORSO_SEGMENTS);
     const angles = contourAngles(plain);
     const rebuild = (surplus: number) =>
-      applyRelief(plain.slice(), angles, relief, t, surplus);
+      applyRelief(plain.slice(), angles, null, relief, t, surplus);
 
     rings.push({
       y: t * H,
@@ -285,15 +349,31 @@ export function torsoRings(torso: TorsoShape, H: number): Ring[] {
 
 /* -------------------------------- limbs --------------------------------- */
 
-/** An ellipse: limbs are not round, and a hand is a paddle. */
-function ellipse(r: number, flat: number, segments: number): number[] {
-  const pts: number[] = new Array(segments * 2);
-  for (let j = 0; j < segments; j++) {
-    const th = (2 * Math.PI * j) / segments;
-    pts[j * 2] = r * Math.cos(th);
-    pts[j * 2 + 1] = r * flat * Math.sin(th);
-  }
-  return pts;
+/**
+ * A limb cross-section: half-width `r`, half-depth `r * flat`, and `corner`
+ * deciding how squarely the two meet. At 2 this is the plain ellipse a thigh
+ * or a forearm wants; the hand takes it past 3, which is what gives a palm a
+ * back, a front and two edges instead of the lens an ellipse makes of it.
+ */
+function limbSection(r: number, flat: number, corner: number, segments: number): number[] {
+  // Drawn dense and then spaced evenly around its own outline; `byArcLength`
+  // says why. The error in a resampled point falls with the square of the
+  // chord spacing, so 3x is already well under a tenth of a millimetre, and
+  // every extra multiple is two more Math.pow per point on every ring.
+  return byArcLength(superellipse(r, r * flat, corner, segments * 3), segments);
+}
+
+/**
+ * Position of each point *along* the contour, scaled to 2*PI so it can be
+ * written and compared exactly like a direction. Points are evenly spaced by
+ * construction, so this is just the index -- which is the whole point: a
+ * feature placed here lands on a vertex, and `ARM_SEGMENTS` is chosen so the
+ * finger gaps do.
+ */
+function contourPositions(segments: number): Float64Array {
+  const out = new Float64Array(segments);
+  for (let j = 0; j < segments; j++) out[j] = (2 * Math.PI * j) / segments;
+  return out;
 }
 
 function limbRings(
@@ -302,6 +382,7 @@ function limbRings(
   H: number,
   count: number,
   spread: number,
+  segments: number,
 ): Ring[] {
   // Nodes are authored top-down; the spline wants ascending knots.
   const asc = [...nodes].sort((l, r) => l.t - r.t);
@@ -310,18 +391,39 @@ function limbRings(
   const xs = asc.map((n) => n.x);
   const zs = asc.map((n) => n.z);
   const flats = asc.map((n) => n.flat);
+  const corners = asc.map((n) => n.corner ?? 2);
+  const rolls = asc.map((n) => n.roll ?? 0);
   const fats = asc.map((n) => n.fat);
 
+  const along = contourPositions(segments);
   const rings: Ring[] = [];
   for (let i = 0; i < count; i++) {
     const t = ts[0] + ((ts[ts.length - 1] - ts[0]) * i) / (count - 1);
     const r = Math.max(0.002, spline(ts, volumes, t)) * H;
     const flat = Math.max(0.2, spline(ts, flats, t));
+    const corner = Math.max(2, spline(ts, corners, t));
 
-    const plain = ellipse(r, flat, LIMB_SEGMENTS);
+    const plain = limbSection(r, flat, corner, segments);
     const angles = contourAngles(plain);
-    const rebuild = (surplus: number) =>
-      applyRelief(plain.slice(), angles, relief, t, surplus);
+
+    // Relief is authored in the limb's own frame -- a thumb is on the thumb
+    // side whatever the wrist is doing -- so the roll is applied after it, to
+    // the finished contour. The scale the solver applies later is uniform on a
+    // limb, so it commutes with the rotation and the area survives untouched.
+    const roll = spline(ts, rolls, t);
+    const cos = Math.cos(roll);
+    const sin = Math.sin(roll);
+    const rebuild = (surplus: number) => {
+      const pts = applyRelief(plain.slice(), angles, along, relief, t, surplus);
+      if (roll === 0) return pts;
+      for (let j = 0; j < pts.length; j += 2) {
+        const u = pts[j];
+        const v = pts[j + 1];
+        pts[j] = u * cos - v * sin;
+        pts[j + 1] = u * sin + v * cos;
+      }
+      return pts;
+    };
 
     rings.push({
       y: t * H,
@@ -345,7 +447,9 @@ const ARM_NODES: (keyof ArmShape)[] = [
   'elbow',
   'forearm',
   'wrist',
+  'palm',
   'knuckle',
+  'fingers',
   'fingertip',
 ];
 
@@ -362,12 +466,12 @@ type LegShapeKeys = ShapeParams['leg'];
 
 export function armRings(arm: ArmShape, H: number): Ring[] {
   const nodes = ARM_NODES.map((k) => arm[k] as LimbNode);
-  return limbRings(nodes, arm.relief, H, LIMB_RINGS, 0.35);
+  return limbRings(nodes, arm.relief, H, ARM_RINGS, 0.35, ARM_SEGMENTS);
 }
 
 export function legRings(leg: ShapeParams['leg'], H: number): Ring[] {
   const nodes = LEG_NODES.map((k) => leg[k] as LimbNode);
-  return limbRings(nodes, leg.relief, H, LIMB_RINGS, 0.4);
+  return limbRings(nodes, leg.relief, H, LIMB_RINGS, 0.4, LIMB_SEGMENTS);
 }
 
 export function neckRings(neck: NeckShape, H: number): Ring[] {
@@ -378,10 +482,10 @@ export function neckRings(neck: NeckShape, H: number): Ring[] {
     const t = neck.base + (neck.top - neck.base) * u;
     // A neck is a column that narrows and leans forward as it rises.
     const r = (neck.width + (neck.topWidth - neck.width) * u) * H;
-    const plain = ellipse(r, neck.flat, LIMB_SEGMENTS);
+    const plain = limbSection(r, neck.flat, 2, LIMB_SEGMENTS);
     const angles = contourAngles(plain);
     const rebuild = (surplus: number) =>
-      applyRelief(plain.slice(), angles, neck.relief, t, surplus);
+      applyRelief(plain.slice(), angles, null, neck.relief, t, surplus);
     rings.push({
       y: t * H,
       area: polygonArea(plain),

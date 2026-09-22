@@ -1,5 +1,13 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AppState, LayoutChangeEvent, PanResponder, StyleSheet, Text, View } from 'react-native';
+import {
+  AppState,
+  LayoutChangeEvent,
+  PanResponder,
+  PixelRatio,
+  StyleSheet,
+  Text,
+  View,
+} from 'react-native';
 import { ExpoWebGLRenderingContext, GLView } from 'expo-gl';
 import * as THREE from 'three';
 
@@ -35,6 +43,11 @@ interface Stage {
   shadow: THREE.Mesh;
   ring: THREE.Mesh;
   gl: ExpoWebGLRenderingContext;
+  /** Off-screen buffer the lit scene is drawn into; see `renderSize`. */
+  target: THREE.WebGLRenderTarget | null;
+  /** Full-screen quad that copies `target` onto the real surface. */
+  blitScene: THREE.Scene;
+  blitCamera: THREE.OrthographicCamera;
   frame: number;
   /** Frames still to be force-flushed; see the note in the render loop. */
   prime: number;
@@ -62,6 +75,32 @@ const DAMPING = 0.02;
 const FOV = 32;
 /** How many frames to force-flush before trusting the surface. */
 const PRIME_FRAMES = 6;
+/**
+ * Rotating was fill-rate bound, not geometry bound. GLView hands back a
+ * drawing buffer at the full native scale -- ~1290x2790 on a 3x phone, 3.6M
+ * pixels -- and every one of them was running a four-light PBR shader. The
+ * figure is 36k triangles, which any phone GPU eats for breakfast; it was the
+ * pixels that cost.
+ *
+ * So the lit scene is drawn into a smaller off-screen target and copied up.
+ * The expensive shading runs at a fraction of the pixel count while the copy
+ * -- one texture fetch per pixel -- runs at full resolution, so edges stay as
+ * sharp as the panel allows. expo-gl exposes no pixel-ratio control (checked
+ * against the v57 GLView docs), so the target is the only lever there is.
+ *
+ * 2x is the point past which a figure this size stops gaining visible detail.
+ * The absolute budget catches tablets, where 2x of a large panel is still more
+ * pixels than is worth shading.
+ *
+ * This doubles as the antialiasing control. expo-gl cannot multisample a render
+ * target on most devices (see `makeBlit`), so on those the silhouette is
+ * antialiased only by resolution and by the linear filter that scales the
+ * target up to the panel. If edges against the dark background read as rough,
+ * raise this -- 2.5 keeps most of the saving, 3 gives the old image back at the
+ * old cost. It is the one number to turn.
+ */
+const MAX_RENDER_RATIO = 2;
+const PIXEL_BUDGET = 1_600_000;
 /** Yaw per pixel of horizontal drag: ~360 degrees per 340 px, close to grabbing it. */
 const YAW_PER_PX = 0.0185;
 const PITCH_PER_PX = 0.006;
@@ -161,6 +200,66 @@ function canvasShim(gl: ExpoWebGLRenderingContext) {
 }
 
 /**
+ * Pixel dimensions to shade at, for a drawing buffer of `w` x `h`. See the note
+ * on MAX_RENDER_RATIO. Never upscales: a 1x panel is already at the budget.
+ */
+function renderSize(w: number, h: number): { width: number; height: number } {
+  const byRatio = MAX_RENDER_RATIO / Math.max(1, PixelRatio.get());
+  const byBudget = Math.sqrt(PIXEL_BUDGET / Math.max(1, w * h));
+  const scale = Math.min(1, byRatio, byBudget);
+  return {
+    width: Math.max(1, Math.round(w * scale)),
+    height: Math.max(1, Math.round(h * scale)),
+  };
+}
+
+/**
+ * The off-screen buffer and the quad that copies it to the screen.
+ *
+ * Half-float, not bytes: three skips tone mapping when the destination is a
+ * render target, so what lands here is linear light that routinely goes above
+ * 1.0 around the key light. In an 8-bit target those values would clamp before
+ * ACES ever saw them and the highlights would flatten. The quad then draws to
+ * the real surface, where tone mapping and the sRGB conversion do run -- so the
+ * final image matches what a direct render produced, only shaded at fewer
+ * pixels.
+ */
+function makeBlit(gl: ExpoWebGLRenderingContext, width: number, height: number) {
+  // RGBA16F is not color-renderable in bare WebGL 2; it takes one of these
+  // extensions. Without the check a driver that lacks them leaves the
+  // framebuffer incomplete, which does not throw -- it just draws nothing, and
+  // the viewer comes up black. Bytes clip the highlights a little early, which
+  // is a far better failure than no picture.
+  const floatTarget =
+    !!gl.getExtension('EXT_color_buffer_float') ||
+    !!gl.getExtension('EXT_color_buffer_half_float');
+
+  const target = new THREE.WebGLRenderTarget(width, height, {
+    type: floatTarget ? THREE.HalfFloatType : THREE.UnsignedByteType,
+    minFilter: THREE.LinearFilter,
+    magFilter: THREE.LinearFilter,
+    depthBuffer: true,
+    // Asking for samples > 0 makes three allocate a multisampled renderbuffer,
+    // and expo-gl does not implement `renderbufferStorageMultisample` -- it
+    // throws outright from the first render. The one multisampling route it can
+    // take is WEBGL_multisampled_render_to_texture, which three uses instead
+    // when it is present, so probe for it rather than assume either way. Absent
+    // it, the target carries no antialiasing and RENDER_RATIO is doing that job
+    // (see the note there).
+    samples: gl.getExtension('WEBGL_multisampled_render_to_texture') ? 2 : 0,
+  });
+  const blitScene = new THREE.Scene();
+  const blitCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+  const quad = new THREE.Mesh(
+    new THREE.PlaneGeometry(2, 2),
+    new THREE.MeshBasicMaterial({ map: target.texture, depthTest: false, depthWrite: false }),
+  );
+  quad.frustumCulled = false;
+  blitScene.add(quad);
+  return { target, blitScene, blitCamera };
+}
+
+/**
  * three r163+ refuses any context that is `instanceof WebGLRenderingContext`,
  * on the assumption that it must be WebGL 1. expo-gl hands back a WebGL 2
  * context whose class *subclasses* WebGLRenderingContext (browsers keep the two
@@ -180,7 +279,10 @@ function createRenderer(gl: ExpoWebGLRenderingContext): THREE.WebGLRenderer {
     return new THREE.WebGLRenderer({
       canvas,
       context: gl as unknown as WebGLRenderingContext,
-      antialias: true,
+      // No antialias on the default framebuffer: nothing is shaded there any
+      // more, only a full-screen texture copy, and asking for MSAA on it would
+      // allocate a multisampled buffer at native size for no benefit.
+      antialias: false,
     });
   } finally {
     scope.WebGLRenderingContext = saved;
@@ -304,6 +406,8 @@ export default function BodyViewer({
       const height = gl.drawingBufferHeight;
 
       const renderer = createRenderer(gl);
+      const shade = renderSize(width, height);
+      const { target, blitScene, blitCamera } = makeBlit(gl, shade.width, shade.height);
       renderer.setSize(width, height, false);
       renderer.setClearColor(new THREE.Color(theme.bgSunken), 1);
       renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -377,6 +481,7 @@ export default function BodyViewer({
 
       stage.current = {
         renderer, scene, camera, body: bodyMesh, shadow, ring, gl,
+        target, blitScene, blitCamera,
         frame: 0,
         prime: PRIME_FRAMES,
         dirty: true,
@@ -435,7 +540,33 @@ export default function BodyViewer({
         );
         s.camera.lookAt(0, focusY, 0);
 
-        s.renderer.render(s.scene, s.camera);
+        // Shade small, present large.
+        //
+        // Every GL call three makes here is WebGL 1 core, but expo-gl is a
+        // partial implementation and this path already turned up one function
+        // it does not have. A viewer that draws nothing is a far worse outcome
+        // than one that draws at full resolution, so a gap costs the
+        // optimisation and nothing else.
+        if (s.target) {
+          try {
+            s.renderer.setRenderTarget(s.target);
+            s.renderer.render(s.scene, s.camera);
+            s.renderer.setRenderTarget(null);
+            s.renderer.render(s.blitScene, s.blitCamera);
+          } catch (err) {
+            console.warn(
+              'BodyViewer: rendering through a scaled target failed, falling back to ' +
+                'full resolution. Rotation will cost more.',
+              err,
+            );
+            s.renderer.setRenderTarget(null);
+            s.target.dispose();
+            s.target = null;
+            s.renderer.render(s.scene, s.camera);
+          }
+        } else {
+          s.renderer.render(s.scene, s.camera);
+        }
 
         // Draining expo-gl's command queue is what actually gets a frame onto
         // the screen the first time -- but it blocks the JS thread on a
@@ -466,6 +597,13 @@ export default function BodyViewer({
       (s.shadow.material as THREE.Material).dispose();
       s.ring.geometry.dispose();
       (s.ring.material as THREE.Material).dispose();
+      s.blitScene.traverse((o) => {
+        const m = o as THREE.Mesh;
+        if (!m.isMesh) return;
+        m.geometry.dispose();
+        (m.material as THREE.Material).dispose();
+      });
+      s.target?.dispose();
       s.renderer.dispose();
       stage.current = null;
     },
@@ -479,6 +617,18 @@ export default function BodyViewer({
     if (width <= 0 || height <= 0) return;
     s.camera.aspect = width / height;
     s.camera.updateProjectionMatrix();
+
+    // A rotation or a split-screen resize gives the surface a new drawing
+    // buffer; the renderer and the shading target both have to follow it, or
+    // the scene keeps being drawn at the old size and arrives stretched.
+    const bw = s.gl.drawingBufferWidth;
+    const bh = s.gl.drawingBufferHeight;
+    const current = s.renderer.getSize(new THREE.Vector2());
+    if (current.x !== bw || current.y !== bh) {
+      s.renderer.setSize(bw, bh, false);
+      const shade = renderSize(bw, bh);
+      s.target?.setSize(shade.width, shade.height);
+    }
     s.dirty = true;
   };
 
@@ -607,10 +757,11 @@ export default function BodyViewer({
     >
       <GLView
         style={styles.canvas}
-        // The figure is all smooth organic curves, so 2x MSAA is visually
-        // indistinguishable from 4x here and halves the per-frame resolve on a
-        // surface this size (native retina, ~1300x2800).
-        msaaSamples={2}
+        // Nothing is shaded on this surface any more -- it receives one
+        // full-screen textured quad, which has no interior edges to
+        // antialias -- so MSAA here would allocate and resolve a multisampled
+        // buffer at native resolution every frame for no visible gain.
+        msaaSamples={0}
         onContextCreate={onContextCreate}
       />
       <View style={styles.touch} collapsable={false} {...responder.panHandlers} />

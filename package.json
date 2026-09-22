@@ -33,6 +33,7 @@
     "typecheck": "tsc --noEmit && tsc -p tools",
     "doctor": "npx --yes expo-doctor",
     "model": "tsx tools/render-body.ts",
+    "inspect-model": "tsx tools/inspect-model.ts",
     "measure": "tsx tools/measure.ts",
     "clean": "rm -rf .expo node_modules/.cache && expo start --clear"
   },

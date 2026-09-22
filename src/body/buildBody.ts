@@ -40,7 +40,6 @@ import {
   shapeFor,
 } from './anthropometry';
 import {
-  LIMB_SEGMENTS,
   Ring,
   armRings,
   earSections,
@@ -99,13 +98,24 @@ const BIAS_GAIN = 0.45;
 
 /**
  * How much of an arm is allowed to disappear inside the torso, as a fraction of
- * its own diameter, from the shoulder down to the hand. The upper arm really
- * does lie against the ribs and is mostly hidden there; a forearm beside a hip
- * is not. Anything the body would bury deeper than this is pushed out until it
+ * its own width, from the shoulder down to the hand. The upper arm really does
+ * lie against the ribs and is mostly hidden there; a forearm beside a hip is
+ * not. Anything the body would bury deeper than this is pushed out until it
  * isn't.
  */
 const ARM_BURY_SHOULDER = 0.78;
-const ARM_BURY_HAND = 0.12;
+const ARM_BURY_HAND = 0.0;
+
+/**
+ * Clear air held between the hand and the thigh, as a fraction of stature.
+ *
+ * A relaxed hand really does brush the thigh, but two swept solids that graze
+ * each other do not read as a hand resting against a leg -- they read as one
+ * solid with a seam in it, which is exactly what the hand did here. The gap is
+ * eased in from the elbow down rather than from the wrist, so the arm leans out
+ * by about two degrees over its whole length instead of kinking at the wrist.
+ */
+const HAND_GAP = 0.009;
 
 /**
  * The BMI the authored shape is meant to depict. Dials are auto-calibrated so
@@ -180,7 +190,9 @@ function calibrateShape(shape: ShapeParams, k: number): ShapeParams {
       elbow: limb(shape.arm.elbow),
       forearm: limb(shape.arm.forearm),
       wrist: limb(shape.arm.wrist),
+      palm: limb(shape.arm.palm),
       knuckle: limb(shape.arm.knuckle),
+      fingers: limb(shape.arm.fingers),
       fingertip: limb(shape.arm.fingertip),
     },
     leg: {
@@ -392,14 +404,38 @@ export function buildBody({ heightCm, weightKg, sex }: BodyInput): BodyResult {
   const swingIn = LANDMARK.shoulder * H;
   const swingFull = (LANDMARK.shoulder - 0.03) * H;
   const armTop = arm[arm.length - 1].y;
-  const armPush = arm.map((ring, i) => {
-    if (ring.y >= swingIn) return 0;
-    const radius = Math.sqrt(ring.area / Math.PI) * armScales[i];
-    const down = Math.min(1, Math.max(0, (armTop - ring.y) / (armTop - LANDMARK.hip * H)));
+  const elbowY = shape.arm.elbow.t * H;
+  const knuckleY = shape.arm.knuckle.t * H;
+
+  // Build the arm once where it is authored, so the swing can be measured
+  // against the outline that will actually be drawn, rather than against an
+  // estimate of it. The previous version estimated three things and got all
+  // three wrong at the hand. It stood the arm off by sqrt(area / PI), the
+  // radius of a circle of equal area, which for a paddle at 2.8:1 is 70%
+  // wider than the hand actually is -- that one errs outwards, and is why a
+  // 120 kg figure measured 62 cm across the shoulders instead of 59. It
+  // compared against the authored centre-line and not the spread one, and it
+  // ran on the area of the plain contour, before the thenar and the thumb
+  // push the palm towards the thigh. Those two err inwards, and they won: the
+  // hand sat 1 mm off the thigh on a lean male figure and inside it on a
+  // female one. Measuring the real outline makes all three moot.
+  const armRest = shapedSections(arm, armScales);
+  const armPush = armRest.map((section) => {
+    const y = section.p;
+    if (y >= swingIn) return 0;
+    let inner = Infinity;
+    let outer = -Infinity;
+    for (let j = 0; j < section.pts.length; j += 2) {
+      inner = Math.min(inner, section.pts[j]);
+      outer = Math.max(outer, section.pts[j]);
+    }
+    const down = Math.min(1, Math.max(0, (armTop - y) / (armTop - LANDMARK.hip * H)));
     const bury = ARM_BURY_SHOULDER + (ARM_BURY_HAND - ARM_BURY_SHOULDER) * down;
-    const clearance = Math.max(torsoEdge(ring.y), legEdge(ring.y)) + radius * (1 - 2 * bury);
-    const blend = ring.y <= swingFull ? 1 : (swingIn - ring.y) / (swingIn - swingFull);
-    return Math.max(0, clearance - ring.cx) * blend;
+    const reach = Math.min(1, Math.max(0, (elbowY - y) / (elbowY - knuckleY)));
+    const want =
+      Math.max(torsoEdge(y), legEdge(y)) - (outer - inner) * bury + HAND_GAP * H * reach;
+    const blend = y <= swingFull ? 1 : (swingIn - y) / (swingIn - swingFull);
+    return Math.max(0, want - inner) * blend;
   });
   const armSections = shapedSections(arm, armScales, armPush);
 
@@ -420,7 +456,10 @@ export function buildBody({ heightCm, weightKg, sex }: BodyInput): BodyResult {
     range: mb.addStack(torsoSections, 'y', { domeStart: 0.35, domeEnd: 0.22 }),
   });
   ranges.push({ part: PART.neck, range: mb.addStack(neckSections, 'y') });
-  const armCaps = { domeStart: 0.9, domeEnd: 0.9 } as const;
+  // `domeStart` is the fingertip end and `domeEnd` the shoulder: the rings are
+  // swept bottom-up. A row of fingertips is blunt and a deep dome there both
+  // rounds it into a point and adds two centimetres of hand that is not there.
+  const armCaps = { domeStart: 0.7, domeEnd: 0.9 } as const;
   ranges.push({ part: PART.armR, range: mb.addStack(armSections, 'y', { ...armCaps }) });
   ranges.push({
     part: PART.armL,

@@ -13,6 +13,13 @@ const config = getDefaultConfig(__dirname);
  */
 const THREE_ESM = path.join(__dirname, 'node_modules/three/build/three.module.js');
 
+/**
+ * Metro treats an unknown extension as source and tries to parse it, so a .glb
+ * has to be declared an asset before `require()` on one will resolve to
+ * something expo-asset can fetch.
+ */
+config.resolver.assetExts = [...config.resolver.assetExts, 'glb'];
+
 config.resolver.resolveRequest = (context, moduleName, platform) => {
   if (moduleName === 'three') {
     return { type: 'sourceFile', filePath: THREE_ESM };

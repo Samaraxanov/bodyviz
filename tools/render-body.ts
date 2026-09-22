@@ -7,6 +7,7 @@
  * wrong side, shows up immediately here.
  *
  *   yarn model 178 76 male preview.png
+ *   yarn model 178 76 male hands.png hand
  */
 import { writeFileSync } from 'fs';
 import { deflateSync } from 'zlib';
@@ -45,7 +46,13 @@ function png(rgb: Uint8Array, w: number, h: number): Buffer {
  * `yarn model 178 76 male out.png head` reframes onto the head, which is the
  * only way to actually judge a face at this resolution.
  */
-function render(body: BodyResult, yaw: number, focusT = 0.52, spanT = 1.24): Uint8Array {
+function render(
+  body: BodyResult,
+  yaw: number,
+  focusT = 0.52,
+  spanT = 1.24,
+  offsetT = 0,
+): Uint8Array {
   const img = new Uint8Array(W * H * 3).fill(16);
   const zbuf = new Float32Array(W * H).fill(Infinity);
   const stature = body.metrics.height;
@@ -64,7 +71,7 @@ function render(body: BodyResult, yaw: number, focusT = 0.52, spanT = 1.24): Uin
     const vx = x * right[0] + y * right[1] + z * right[2];
     const vy = x * up[0] + y * up[1] + z * up[2];
     const vz = x * fwd[0] + y * fwd[1] + z * fwd[2];
-    return [W / 2 + (vx / vz) * f, H / 2 - (vy / vz) * f, vz];
+    return [W / 2 + ((vx - offsetT * stature) / vz) * f, H / 2 - (vy / vz) * f, vz];
   };
 
   for (let t = 0; t < idx.length; t += 3) {
@@ -116,16 +123,31 @@ function render(body: BodyResult, yaw: number, focusT = 0.52, spanT = 1.24): Uin
 
 const [hStr, wStr, sexArg, outArg, frameArg] = process.argv.slice(2);
 if (!hStr || !wStr || (sexArg !== 'male' && sexArg !== 'female')) {
-  console.error('usage: yarn model <heightCm> <weightKg> <male|female> [out.png]');
+  console.error(
+    'usage: yarn model <heightCm> <weightKg> <male|female> [out.png]' +
+      ' [head|hand|focusT,spanT[,offsetT]]',
+  );
   process.exit(1);
 }
 const out = outArg ?? `body-${hStr}-${wStr}-${sexArg}.png`;
 const body = buildBody({ heightCm: +hStr, weightKg: +wStr, sex: sexArg });
-// Head framing keeps a little neck in shot; the jaw-to-throat junction is
-// where most of what looks wrong about a head actually shows up.
-const [focusT, spanT] = frameArg === 'head' ? [0.945, 0.26] : [0.52, 1.24];
+// Named framings, or an explicit `<focusT>,<spanT>` pair. Head framing keeps a
+// little neck in shot, because the jaw-to-throat junction is where most of what
+// looks wrong about a head shows up; hand framing keeps the thigh in shot for
+// the same reason -- what goes wrong with a hand is its relationship to the leg
+// beside it, not the hand on its own.
+// [focus height, how much of the figure fills the frame, sideways offset], all
+// as fractions of stature. A hand is nowhere near the midline, so without the
+// offset a close hand framing shows a thigh.
+const FRAMES: Record<string, [number, number, number]> = {
+  head: [0.945, 0.26, 0],
+  hand: [0.437, 0.30, 0.062],
+};
+const [focusT, spanT, offsetT] = frameArg
+  ? FRAMES[frameArg] ?? (frameArg.split(',').map(Number) as [number, number, number])
+  : [0.52, 1.24, 0];
 const views = [0, Math.PI / 2, Math.PI, Math.PI * 1.5].map((y) =>
-  render(body, y, focusT, spanT),
+  render(body, y, focusT, spanT, offsetT ?? 0),
 );
 const sheet = new Uint8Array(W * 4 * H * 3).fill(16);
 views.forEach((v, k) => {

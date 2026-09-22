@@ -25,7 +25,14 @@
       "favicon": "./assets/favicon.png"
     },
     "plugins": [
-      "expo-asset",
+      [
+        "expo-asset",
+        {
+          "assets": [
+            "./assets/model"
+          ]
+        }
+      ],
       [
         "expo-build-properties",
         {

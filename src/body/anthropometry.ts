@@ -80,6 +80,20 @@ export interface Relief {
   /** Also place a mirrored copy on the other side of the midline. */
   paired?: boolean;
   /**
+   * Read `around` and `arc` as a position *along* the outline rather than as a
+   * direction. Both are still in radians over a full turn, and on a round
+   * section they mean the same thing.
+   *
+   * The difference only matters on a flat one, and then it matters completely.
+   * A bicep is pinned to a direction: it faces forwards, wherever the surface
+   * happens to be. The gaps between four fingers are not -- they are spaced
+   * across the back of the hand, and on a 3.6:1 section the whole of that
+   * surface lies between 0.9 and 1.6 radians of *direction*, so placing them
+   * by direction stacks all three on top of each other. Along the contour they
+   * are three evenly spaced points, which is what they are on a hand.
+   */
+  alongContour?: boolean;
+  /**
    * How the feature responds to body fat, per unit of surplus scale.
    * Negative fades it out (muscle definition disappears under fat), positive
    * grows it (love handles, a softening lower belly). 0 holds it constant.
@@ -95,6 +109,8 @@ export const ANGLE = {
   back: -Math.PI / 2,
   /** +x, out towards the body's own side. */
   side: 0,
+  /** -x, in towards the midline. On a hanging arm this is the palm. */
+  inward: Math.PI,
 } as const;
 
 /** A named node of a limb: where its centre-line is and how much it carries. */
@@ -112,6 +128,23 @@ export interface LimbNode {
   volume: number;
   /** Depth as a fraction of width. 1 is circular; a hand is a flat paddle. */
   flat: number;
+  /**
+   * Superellipse exponent, as on Station; 2 (the default) is a pure ellipse.
+   * A thigh really is an ellipse and wants nothing else. A hand is not: a palm
+   * has a back, a front and two edges, and an ellipse gives it none of them --
+   * swept at 2.8:1 it is a lens, which is why the old hand read as a blade.
+   */
+  corner?: number;
+  /**
+   * Rotation of the section about the limb's own axis, in radians, positive
+   * turning the outboard face forwards. Everything above the elbow is round
+   * enough not to care. The hand is not: a forearm at rest is half pronated,
+   * so the palm faces the thigh *and* slightly back, and the back of the hand
+   * faces forwards and out. Built without it the hand is exactly edge-on to
+   * the camera in the view the app opens at, and 9 cm of hand is drawn as a
+   * 3 cm sliver -- which is what made it read as a flipper rather than a hand.
+   */
+  roll?: number;
   /** Fat affinity, as on Station. */
   fat: number;
 }
@@ -154,7 +187,12 @@ export interface ArmShape {
   elbow: LimbNode;
   forearm: LimbNode;
   wrist: LimbNode;
+  /** The heel of the hand, where it widens out of the wrist. */
+  palm: LimbNode;
+  /** The metacarpal heads: the widest and squarest section of the hand. */
   knuckle: LimbNode;
+  /** The four-finger row, narrower and thinner than the palm that carries it. */
+  fingers: LimbNode;
   fingertip: LimbNode;
   relief: Relief[];
 }
@@ -304,10 +342,12 @@ const MALE: ShapeParams = {
     deltoid:   { t: 0.795, x: 0.093, z: -0.002, volume: 0.034, flat: 1.00, fat: 0.70 },
     bicep:     { t: 0.740, x: 0.099, z: -0.002, volume: 0.027, flat: 1.00, fat: 0.95 },
     elbow:     { t: 0.633, x: 0.102, z:  0.001, volume: 0.022, flat: 1.06, fat: 0.46 },
-    forearm:   { t: 0.598, x: 0.102, z:  0.003, volume: 0.024, flat: 1.10, fat: 0.56 },
-    wrist:     { t: 0.487, x: 0.110, z:  0.008, volume: 0.012, flat: 1.40, fat: 0.14 },
-    knuckle:   { t: 0.443, x: 0.111, z:  0.012, volume: 0.010, flat: 2.65, fat: 0.12 },
-    fingertip: { t: 0.385, x: 0.112, z:  0.014, volume: 0.005, flat: 2.60, fat: 0.06 },
+    forearm:   { t: 0.598, x: 0.102, z:  0.003, volume: 0.024, flat: 1.10, roll: 0.18, fat: 0.56 },
+    wrist:     { t: 0.487, x: 0.110, z:  0.008, volume: 0.0116, flat: 1.38, corner: 2.15, roll: 0.48, fat: 0.14 },
+    palm:      { t: 0.470, x: 0.111, z:  0.011, volume: 0.0095, flat: 2.15, corner: 2.80, roll: 0.60, fat: 0.13 },
+    knuckle:   { t: 0.435, x: 0.112, z:  0.013, volume: 0.0086, flat: 2.85, corner: 3.30, roll: 0.63, fat: 0.12 },
+    fingers:   { t: 0.408, x: 0.112, z:  0.013, volume: 0.0060, flat: 3.65, corner: 3.50, roll: 0.63, fat: 0.08 },
+    fingertip: { t: 0.387, x: 0.112, z:  0.013, volume: 0.0045, flat: 3.30, corner: 3.10, roll: 0.63, fat: 0.06 },
     relief: [
       // The deltoid caps the shoulder from outside; the bicep and tricep face
       // each other across the upper arm, and the bicep sits higher.
@@ -323,10 +363,40 @@ const MALE: ShapeParams = {
       { name: 'brachioradialis', at: 0.600, rise: 0.028, around: ANGLE.front - 0.35, arc: 0.55, depth: 0.152, withFat: -0.5 },
       { name: 'flexorBelly', at: 0.588, rise: 0.030, around: ANGLE.back + 0.30, arc: 0.55, depth: 0.104, withFat: -0.4 },
       { name: 'ulnarRidge', at: 0.545, rise: 0.045, around: ANGLE.back, arc: 0.22, depth: -0.057 },
-      // Hand: knuckles across the back of it, a thumb mass on the inner edge.
-      { name: 'knuckles', at: 0.441, rise: 0.008, around: ANGLE.back, arc: 0.85, depth: 0.114 },
-      { name: 'thenar', at: 0.455, rise: 0.016, around: ANGLE.front + 1.10, arc: 0.50, depth: 0.323 },
-      { name: 'palmHollow', at: 0.448, rise: 0.016, around: ANGLE.front - 0.50, arc: 0.40, depth: -0.076 },
+      // The hand. It hangs with the palm against the thigh, so in the slice's
+      // own frame the back of the hand faces `side` (+x, outboard), the palm
+      // faces `inward`, the thumb edge is `front` and the little finger
+      // `back`. The old set had the knuckles on the little-finger edge and the
+      // palm hollow on the back of the hand -- both a quarter turn out, which
+      // is most of why the hand read as a featureless blade.
+      //
+      // The block does most of the work -- a squared palm, a narrower finger
+      // row, a blunt end -- with a thumb on the corner and three grooves down
+      // the finger row. See the note on those grooves below: they are the one
+      // feature here whose angles are pinned to the segment count.
+      { name: 'ulnarStyloid', at: 0.484, rise: 0.014, around: ANGLE.inward - 1.30, arc: 0.30, depth: 0.075 },
+      { name: 'thumb', at: 0.462, rise: 0.019, around: ANGLE.inward - 1.05, arc: 0.40, depth: 0.300 },
+      { name: 'thenar', at: 0.450, rise: 0.020, around: ANGLE.inward - 0.55, arc: 0.36, depth: 0.180 },
+      { name: 'hypothenar', at: 0.452, rise: 0.024, around: ANGLE.inward + 0.60, arc: 0.36, depth: 0.120 },
+      { name: 'palmHollow', at: 0.448, rise: 0.018, around: ANGLE.inward, arc: 0.26, depth: -0.140 },
+      { name: 'knuckleRidge', at: 0.437, rise: 0.014, around: ANGLE.side, arc: 0.55, depth: 0.100 },
+      // Individual fingers, which is the one thing that separates a hand from
+      // a mitten. `alongContour` is what makes them possible -- see the note
+      // on it -- and the placement is then arithmetic: the outline carries 36
+      // evenly spaced points, so 0 and +/-2pi/9 are vertices 0, 4 and 32, and
+      // `paired` puts their mirrors on 18, 14 and 22. Every groove is centred
+      // on a vertex with a vertex either side, so a 0.2 radian Gaussian
+      // resolves cleanly. Move ARM_SEGMENTS off a multiple of 9 and they fall
+      // between vertices and turn into noise.
+      //
+      // `depth` scales each point's own radius, and a point in the middle of
+      // the back of the hand is only its half-thickness from the centre-line.
+      // 0.40 of that is a 3 mm groove: enough to read as four fingers at the
+      // distance the whole figure is looked at, not enough to carve the hand
+      // into strips when someone zooms in on it.
+      { name: 'fingerGapMid', at: 0.404, rise: 0.020, alongContour: true, around: ANGLE.side, arc: 0.20, depth: -0.400, paired: true },
+      { name: 'fingerGapIn', at: 0.404, rise: 0.020, alongContour: true, around: ANGLE.side + (2 * Math.PI) / 9, arc: 0.20, depth: -0.350, paired: true },
+      { name: 'fingerGapOut', at: 0.404, rise: 0.020, alongContour: true, around: ANGLE.side - (2 * Math.PI) / 9, arc: 0.20, depth: -0.350, paired: true },
     ],
   },
 
@@ -450,10 +520,12 @@ const FEMALE: ShapeParams = {
     deltoid:   { t: 0.795, x: 0.085, z: -0.002, volume: 0.031, flat: 1.00, fat: 0.78 },
     bicep:     { t: 0.740, x: 0.090, z: -0.002, volume: 0.025, flat: 1.00, fat: 1.05 },
     elbow:     { t: 0.633, x: 0.093, z:  0.001, volume: 0.020, flat: 1.06, fat: 0.50 },
-    forearm:   { t: 0.598, x: 0.094, z:  0.003, volume: 0.021, flat: 1.10, fat: 0.60 },
-    wrist:     { t: 0.487, x: 0.101, z:  0.008, volume: 0.010, flat: 1.40, fat: 0.14 },
-    knuckle:   { t: 0.443, x: 0.102, z:  0.012, volume: 0.009, flat: 2.65, fat: 0.12 },
-    fingertip: { t: 0.385, x: 0.103, z:  0.014, volume: 0.004, flat: 2.60, fat: 0.06 },
+    forearm:   { t: 0.598, x: 0.094, z:  0.003, volume: 0.021, flat: 1.10, roll: 0.18, fat: 0.60 },
+    wrist:     { t: 0.487, x: 0.101, z:  0.008, volume: 0.0100, flat: 1.36, corner: 2.15, roll: 0.48, fat: 0.14 },
+    palm:      { t: 0.470, x: 0.102, z:  0.011, volume: 0.0082, flat: 2.12, corner: 2.80, roll: 0.60, fat: 0.13 },
+    knuckle:   { t: 0.435, x: 0.103, z:  0.013, volume: 0.0074, flat: 2.80, corner: 3.30, roll: 0.63, fat: 0.12 },
+    fingers:   { t: 0.408, x: 0.103, z:  0.013, volume: 0.0052, flat: 3.60, corner: 3.50, roll: 0.63, fat: 0.08 },
+    fingertip: { t: 0.387, x: 0.103, z:  0.013, volume: 0.0039, flat: 3.25, corner: 3.10, roll: 0.63, fat: 0.06 },
     relief: [
       { name: 'deltoidCap', at: 0.792, rise: 0.022, around: ANGLE.side, arc: 0.70, depth: 0.133, withFat: -0.3 },
       { name: 'bicep', at: 0.722, rise: 0.034, around: ANGLE.front, arc: 0.62, depth: 0.105, withFat: -0.4 },
@@ -463,9 +535,15 @@ const FEMALE: ShapeParams = {
       { name: 'brachioradialis', at: 0.600, rise: 0.028, around: ANGLE.front - 0.35, arc: 0.55, depth: 0.123, withFat: -0.4 },
       { name: 'flexorBelly', at: 0.588, rise: 0.030, around: ANGLE.back + 0.30, arc: 0.55, depth: 0.085, withFat: -0.3 },
       { name: 'ulnarRidge', at: 0.545, rise: 0.045, around: ANGLE.back, arc: 0.22, depth: -0.057 },
-      { name: 'knuckles', at: 0.441, rise: 0.008, around: ANGLE.back, arc: 0.85, depth: 0.104 },
-      { name: 'thenar', at: 0.455, rise: 0.016, around: ANGLE.front + 1.10, arc: 0.50, depth: 0.304 },
-      { name: 'palmHollow', at: 0.448, rise: 0.016, around: ANGLE.front - 0.50, arc: 0.40, depth: -0.076 },
+      { name: 'ulnarStyloid', at: 0.484, rise: 0.014, around: ANGLE.inward - 1.30, arc: 0.30, depth: 0.065 },
+      { name: 'thumb', at: 0.462, rise: 0.019, around: ANGLE.inward - 1.05, arc: 0.40, depth: 0.280 },
+      { name: 'thenar', at: 0.450, rise: 0.020, around: ANGLE.inward - 0.55, arc: 0.36, depth: 0.165 },
+      { name: 'hypothenar', at: 0.452, rise: 0.024, around: ANGLE.inward + 0.60, arc: 0.36, depth: 0.115 },
+      { name: 'palmHollow', at: 0.448, rise: 0.018, around: ANGLE.inward, arc: 0.26, depth: -0.130 },
+      { name: 'knuckleRidge', at: 0.437, rise: 0.014, around: ANGLE.side, arc: 0.55, depth: 0.090 },
+      { name: 'fingerGapMid', at: 0.404, rise: 0.020, alongContour: true, around: ANGLE.side, arc: 0.20, depth: -0.370, paired: true },
+      { name: 'fingerGapIn', at: 0.404, rise: 0.020, alongContour: true, around: ANGLE.side + (2 * Math.PI) / 9, arc: 0.20, depth: -0.320, paired: true },
+      { name: 'fingerGapOut', at: 0.404, rise: 0.020, alongContour: true, around: ANGLE.side - (2 * Math.PI) / 9, arc: 0.20, depth: -0.320, paired: true },
     ],
   },
 
